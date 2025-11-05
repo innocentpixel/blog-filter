@@ -7,33 +7,25 @@ console.log('[BlogFilter] main.js načítaný');
   const SITEMAP_URL = '/sitemap.xml';
   const TAGS_CACHE_KEY = 'blogAllTags';
   const FILTER_KEY = 'blogFilterTag';
+  const REFRESH_INTERVAL_DAYS = 7;
 
   async function fetchSitemapUrls() {
-    try {
-      const res = await fetch(SITEMAP_URL);
-      const xmlText = await res.text();
-      const parser = new DOMParser();
-      const xml = parser.parseFromString(xmlText, 'text/xml');
-      const urls = Array.from(xml.querySelectorAll('url loc'))
-        .map(el => el.textContent.trim())
-        .filter(u => u.includes('/blog/') && !u.endsWith('/blog/'));
-      console.log(`[BlogFilter] Načítaných článkov: ${urls.length}`);
-      return urls;
-    } catch (err) {
-      console.error('[BlogFilter] Chyba pri čítaní sitemapu', err);
-      return [];
-    }
+    const res = await fetch(SITEMAP_URL);
+    const xmlText = await res.text();
+    const xml = new DOMParser().parseFromString(xmlText, 'text/xml');
+    return Array.from(xml.querySelectorAll('url loc'))
+      .map(el => el.textContent.trim())
+      .filter(u => u.includes('/blog/') && !u.endsWith('/blog/'));
   }
 
   async function extractTagsFromArticle(url) {
     try {
-      const res = await fetch(url);
+      const res = await fetch(url, { cache: 'no-store' });
       const html = await res.text();
       const doc = new DOMParser().parseFromString(html, 'text/html');
-      const tags = Array.from(doc.querySelectorAll('.article-tags a[data-tag]'))
+      return Array.from(doc.querySelectorAll('.article-tags a[data-tag]'))
         .map(a => a.dataset.tag?.trim())
         .filter(Boolean);
-      return tags;
     } catch {
       return [];
     }
@@ -57,7 +49,6 @@ console.log('[BlogFilter] main.js načítaný');
 
   function buildFilters(allTags, articles) {
     if (document.querySelector('.blog-filters') || !allTags.size) return;
-
     const sectionDesc = document.querySelector('.sectionDescription');
     if (!sectionDesc) return;
 
@@ -78,12 +69,10 @@ console.log('[BlogFilter] main.js načítaný');
         buttons.forEach(b => b.classList.toggle('active', b === btn));
         if (tag === 'all') localStorage.removeItem(FILTER_KEY);
         else localStorage.setItem(FILTER_KEY, tag);
-
         const url = new URL(location.href);
         if (tag === 'all') url.searchParams.delete('tag');
         else url.searchParams.set('tag', tag);
         history.replaceState({}, '', url.toString());
-
         applyFilter(tag, articles);
       });
     });
@@ -102,34 +91,37 @@ console.log('[BlogFilter] main.js načítaný');
         article.style.display = '';
         return;
       }
-      const articleTags = Array.from(article.querySelectorAll('.article-tags a[data-tag]'))
-        .map(a => a.dataset.tag);
+      const articleTags = Array.from(article.querySelectorAll('.article-tags a[data-tag]')).map(a => a.dataset.tag);
       article.style.display = articleTags.includes(tag) ? '' : 'none';
     });
   }
 
   async function init() {
-    let allTags = new Set();
-    const cached = localStorage.getItem(TAGS_CACHE_KEY);
-
-    if (cached) {
-      allTags = new Set(JSON.parse(cached));
-      console.log(`[BlogFilter] Načítané tagy z cache: ${allTags.size}`);
-    } else {
-      const urls = await fetchSitemapUrls();
-      for (const url of urls) {
-        const tags = await extractTagsFromArticle(url);
-        tags.forEach(t => allTags.add(t));
-      }
-      localStorage.setItem(TAGS_CACHE_KEY, JSON.stringify([...allTags]));
-      console.log(`[BlogFilter] Tagy uložené do cache: ${allTags.size}`);
-    }
-
+    let cached = JSON.parse(localStorage.getItem(TAGS_CACHE_KEY) || '{}');
+    const lastUpdate = cached._updated || 0;
+    const now = Date.now();
+    const expired = (now - lastUpdate) / 86400000 > REFRESH_INTERVAL_DAYS;
+    const allTags = new Set(cached.tags || []);
     const articles = Array.from(document.querySelectorAll('.news-item'));
-    if (articles.length) {
-      buildFilters(allTags, articles);
-      console.log('[BlogFilter] Filtre zobrazené.');
+
+    if (articles.length) buildFilters(allTags, articles);
+
+    if (!expired) {
+      console.log('[BlogFilter] Používam uložené tagy:', allTags.size);
+      return;
     }
+
+    console.log('[BlogFilter] Aktualizujem tagy zo sitemapu...');
+    const urls = await fetchSitemapUrls();
+    for (const url of urls) {
+      const tags = await extractTagsFromArticle(url);
+      tags.forEach(t => allTags.add(t));
+      // priebežné ukladanie
+      localStorage.setItem(TAGS_CACHE_KEY, JSON.stringify({ tags: [...allTags], _updated: now }));
+    }
+
+    console.log(`[BlogFilter] Tagy načítané: ${allTags.size}`);
+    buildFilters(allTags, articles);
   }
 
   init();
