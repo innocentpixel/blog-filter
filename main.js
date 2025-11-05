@@ -1,8 +1,14 @@
 console.log('[BlogFilter] main.js načítaný');
 
+// 🔧 Funkčná oprava pre všetky blog URL
 (function () {
-  if (!location.pathname.startsWith('/blog')) return;
-  console.log('[BlogFilter] Aktivovaný pre blog');
+  const path = location.pathname;
+  if (!path.includes('/blog')) {
+    console.log('[BlogFilter] Nie je blogová stránka → stop');
+    return;
+  }
+
+  console.log('[BlogFilter] Aktivovaný pre blog:', path);
 
   function extractTagsFromHTML(html) {
     const parser = new DOMParser();
