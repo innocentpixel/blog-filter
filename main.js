@@ -1,3 +1,4 @@
+console.log('[BlogFilter] main.js načítaný');
 <script>
 (function(){
   if (!location.pathname.startsWith('/blog')) return;
