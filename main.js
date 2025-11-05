@@ -1,128 +1,243 @@
-console.log('[BlogFilter] main.js načítaný');
-
+<script>
 (function(){
   if(!location.pathname.startsWith('/blog')) return;
-  console.log('[BlogFilter] Aktivovaný na blogu');
 
   const SITEMAP_URL = '/sitemap.xml';
-  const TAGS_CACHE_KEY = 'blogAllTags';
+  const CACHE_KEY = 'blogArticlesCacheV2';         // verzovaný kľúč (zmenou vynútiš refresh)
+  const TAGS_KEY  = 'blogAllTagsV2';
   const FILTER_KEY = 'blogFilterTag';
-  const REFRESH_INTERVAL_DAYS = 7;
+  const CACHE_DAYS = 7;                            // po koľkých dňoch obnoviť cache
+  const PAGE_SIZE = 12;                            // koľko článkov naraz zobraziť v client-mode
+  const CONCURRENCY = 4;                           // koľko fetchov naraz pri indexovaní
 
+  // --- Pomocné ---
+  const byDateDesc = (a,b) => (b.dateTs||0) - (a.dateTs||0);
+  const cut = (str, n=160) => str.length>n ? str.slice(0,n-1)+'…' : str;
+
+  function parseDateToTs(s){
+    // podporí ISO v datetime aj formát „D.M.YYYY“
+    if(!s) return 0;
+    const iso = Date.parse(s);
+    if(!isNaN(iso)) return iso;
+    const m = s.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+    if(m){
+      const [_,d,mo,y] = m;
+      return new Date(+y, +mo-1, +d).getTime();
+    }
+    return 0;
+  }
+
+  // --- Získanie URL z mapy stránok (iba /blog/… články) ---
   async function fetchSitemapUrls() {
-    const res = await fetch(SITEMAP_URL);
-    const xmlText = await res.text();
-    const xml = new DOMParser().parseFromString(xmlText, 'text/xml');
+    const res = await fetch(SITEMAP_URL, {cache:'no-store'});
+    const xml = new DOMParser().parseFromString(await res.text(), 'text/xml');
     return Array.from(xml.querySelectorAll('url loc'))
       .map(el => el.textContent.trim())
       .filter(u => u.includes('/blog/') && !u.endsWith('/blog/'));
   }
 
-  async function extractTagsFromArticle(url) {
-    try {
-      const res = await fetch(url, { cache: 'no-store' });
-      const html = await res.text();
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-      return Array.from(doc.querySelectorAll('.article-tags a[data-tag]'))
-        .map(a => a.dataset.tag?.trim())
-        .filter(Boolean);
-    } catch {
-      return [];
+  // --- Parsovanie článku ---
+  async function fetchArticle(url){
+    const res = await fetch(url, {cache:'no-store'});
+    const html = await res.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const title = doc.querySelector('h1')?.textContent.trim() || '';
+    const timeEl = doc.querySelector('time[datetime]') || doc.querySelector('.text time');
+    const dateRaw = timeEl?.getAttribute('datetime') || timeEl?.textContent?.trim() || '';
+    const dateTs = parseDateToTs(dateRaw);
+
+    // obrázok: skúsiť og:image, inak prvý obrázok v článku
+    let img = doc.querySelector('meta[property="og:image"]')?.getAttribute('content') || '';
+    if(!img){
+      img = doc.querySelector('.article-detail img, .content-inner img')?.getAttribute('src') || '';
     }
+
+    // popis: prvý rozumný odstavec
+    let desc = doc.querySelector('.article-detail p, article p, .content-inner p')?.textContent?.trim() || '';
+    desc = cut(desc, 220);
+
+    // tagy
+    const tags = Array.from(doc.querySelectorAll('.article-tags a[data-tag]'))
+      .map(a => (a.getAttribute('data-tag')||'').trim())
+      .filter(Boolean);
+
+    return {url, title, dateRaw, dateTs, img, desc, tags};
   }
 
-  function injectTagsIntoArticle(article, tags) {
-    if (!tags.length || article.querySelector('.article-tags')) return;
-    const div = document.createElement('div');
-    div.className = 'article-tags';
-    tags.forEach(tag => {
-      const a = document.createElement('a');
-      a.href = '/blog/?tag=' + encodeURIComponent(tag);
-      a.className = 'tag';
-      a.dataset.tag = tag;
-      a.textContent = '#' + tag;
-      div.appendChild(a);
-    });
-    const desc = article.querySelector('.description');
-    if (desc) desc.insertAdjacentElement('afterend', div);
+  // --- Paralelné načítanie s obmedzenou súbežnosťou ---
+  async function fetchAllArticles(urls){
+    const out = [];
+    let i = 0;
+    async function worker(){
+      while(i < urls.length){
+        const my = i++;
+        const url = urls[my];
+        try{
+          const a = await fetchArticle(url);
+          out.push(a);
+        }catch(e){
+          // prežijeme chybu jedného článku
+        }
+      }
+    }
+    const workers = Array.from({length:CONCURRENCY}, worker);
+    await Promise.all(workers);
+    return out.sort(byDateDesc);
   }
 
-  function buildFilters(allTags, articles) {
-    if (document.querySelector('.blog-filters') || !allTags.size) return;
-    const sectionDesc = document.querySelector('.sectionDescription');
-    if (!sectionDesc) return;
+  // --- Cache helpers ---
+  function loadCache(){
+    try{
+      const obj = JSON.parse(localStorage.getItem(CACHE_KEY) || '{}');
+      const ageDays = (Date.now() - (obj._ts||0)) / 86400000;
+      if(ageDays > CACHE_DAYS) return null;
+      return obj;
+    }catch{ return null; }
+  }
+  function saveCache(articles){
+    const allTags = Array.from(new Set(articles.flatMap(a => a.tags)));
+    localStorage.setItem(CACHE_KEY, JSON.stringify({_ts:Date.now(), articles}));
+    localStorage.setItem(TAGS_KEY, JSON.stringify(allTags));
+    return allTags;
+  }
+  function loadTags(){ try{ return JSON.parse(localStorage.getItem(TAGS_KEY)||'[]'); }catch{ return []; } }
 
+  // --- UI: vloženie filtrov pod sekciu popisu ---
+  function renderFilters(tags){
+    if(document.querySelector('.blog-filters')) return;
+    const host = document.querySelector('.sectionDescription');
+    if(!host) return;
     const bar = document.createElement('div');
     bar.className = 'blog-filters';
-    bar.innerHTML =
-      '<button data-filter="all" class="active">Všetko</button>' +
-      Array.from(allTags)
-        .map(tag => `<button data-filter="${tag}">${tag}</button>`)
-        .join('');
+    bar.innerHTML = [
+      `<button data-filter="all">Všetko</button>`,
+      ...tags.map(t => `<button data-filter="${t}">${t}</button>`)
+    ].join('');
+    host.insertAdjacentElement('afterend', bar);
+    return bar;
+  }
 
-    sectionDesc.insertAdjacentElement('afterend', bar);
+  // --- UI: prerender výpisu (client-mode) ---
+  function renderList(articles, mount, limit){
+    mount.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    articles.slice(0, limit).forEach(a => {
+      const item = document.createElement('div');
+      item.className = 'news-item';
+      item.innerHTML = `
+        <div class="image">
+          <a href="${a.url}" title="${a.title}">
+            <img src="${a.img || ''}" alt="${a.title}">
+          </a>
+        </div>
+        <div class="text">
+          <time>${a.dateRaw || ''}</time>
+          <a href="${a.url}" class="title">${a.title}</a>
+          <div class="description"><p>${a.desc || ''}</p></div>
+          ${a.tags?.length ? `<div class="article-tags">${
+            a.tags.map(t=>`<a href="/blog/?tag=${encodeURIComponent(t)}" class="tag" data-tag="${t}">#${t}</a>`).join('')
+          }</div>`:''}
+        </div>
+        <a href="${a.url}" class="cely-clanek">Celý článok</a>
+      `;
+      frag.appendChild(item);
+    });
+    mount.appendChild(frag);
+  }
 
-    const buttons = bar.querySelectorAll('button');
-    buttons.forEach(btn => {
-      btn.addEventListener('click', () => {
-        const tag = btn.dataset.filter;
-        buttons.forEach(b => b.classList.toggle('active', b === btn));
-        if (tag === 'all') localStorage.removeItem(FILTER_KEY);
-        else localStorage.setItem(FILTER_KEY, tag);
-        const url = new URL(location.href);
-        if (tag === 'all') url.searchParams.delete('tag');
-        else url.searchParams.set('tag', tag);
-        history.replaceState({}, '', url.toString());
-        applyFilter(tag, articles);
+  // --- UI: aktivácia filtrov + client-mode ---
+  function attachFilterLogic(bar, allArticles){
+    const list = document.querySelector('#newsWrapper .news-wrapper') || document.querySelector('.news-wrapper') || document.querySelector('#newsWrapper');
+    if(!list) return;
+
+    const btns = bar.querySelectorAll('button');
+    let current = localStorage.getItem(FILTER_KEY) || new URL(location.href).searchParams.get('tag') || 'all';
+    let shown = PAGE_SIZE;
+
+    function apply(tag){
+      current = tag;
+      shown = PAGE_SIZE;
+
+      // do URL & storage
+      const u = new URL(location.href);
+      if(tag==='all'){ u.searchParams.delete('tag'); localStorage.removeItem(FILTER_KEY); }
+      else { u.searchParams.set('tag', tag); localStorage.setItem(FILTER_KEY, tag); }
+      history.replaceState({}, '', u.toString());
+
+      // vybrať zdroj dát
+      const filtered = (tag==='all') ? allArticles : allArticles.filter(a => a.tags?.includes(tag));
+
+      // client-mode: nahradíme pôvodný výpis naším renderom
+      renderList(filtered, list, shown);
+
+      // „Načítať viac“ (ak je treba)
+      addLoadMore(list, filtered);
+
+      // active class
+      btns.forEach(b => b.classList.toggle('active', b.dataset.filter===tag));
+    }
+
+    function addLoadMore(mount, data){
+      // zmaž staré tlačidlo
+      mount.parentElement.querySelector('.clientLoadMore')?.remove();
+      if(data.length <= shown) return;
+      const more = document.createElement('div');
+      more.className = 'clientLoadMore';
+      more.style.textAlign = 'center';
+      more.style.margin = '20px 0';
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-secondary';
+      btn.textContent = 'Načítať viac';
+      btn.addEventListener('click', ()=>{
+        shown += PAGE_SIZE;
+        renderList(data, mount, shown);
+        if(data.length <= shown) more.remove();
       });
-    });
-
-    const savedTag = localStorage.getItem(FILTER_KEY) ||
-      new URL(location.href).searchParams.get('tag');
-    if (savedTag) {
-      const btn = bar.querySelector(`[data-filter="${savedTag}"]`);
-      if (btn) btn.click();
+      more.appendChild(btn);
+      mount.parentElement.appendChild(more);
     }
+
+    // clicky
+    btns.forEach(b => b.addEventListener('click', ()=>apply(b.dataset.filter)));
+
+    // auto-apply po načítaní
+    // skryť pôvodné stránkovanie (v client-mode nedáva zmysel)
+    const listingControls = document.querySelector('.listingControls');
+    if(listingControls) listingControls.style.display = 'none';
+
+    // spusti
+    // ak náhodou current nie je v set-e tagov (napr. vymazaný), prepni na all
+    if(current!=='all' && !allArticles.some(a => a.tags?.includes(current))) current='all';
+    apply(current);
   }
 
-  function applyFilter(tag, articles) {
-    articles.forEach(article => {
-      if (tag === 'all') {
-        article.style.display = '';
-        return;
+  // --- Štart ---
+  (async function start(){
+    try{
+      // 1) priprav miesto pre filtre (aj keby cache nebola)
+      const cached = loadCache();
+      const tagsFromCache = loadTags();
+      if(tagsFromCache.length){
+        const bar = renderFilters(tagsFromCache);
+        if(cached?.articles?.length && bar){
+          attachFilterLogic(bar, cached.articles);
+        }
       }
-      const articleTags = Array.from(article.querySelectorAll('.article-tags a[data-tag]')).map(a => a.dataset.tag);
-      article.style.display = articleTags.includes(tag) ? '' : 'none';
-    });
-  }
 
-  async function init() {
-    let cached = JSON.parse(localStorage.getItem(TAGS_CACHE_KEY) || '{}');
-    const lastUpdate = cached._updated || 0;
-    const now = Date.now();
-    const expired = (now - lastUpdate) / 86400000 > REFRESH_INTERVAL_DAYS;
-    const allTags = new Set(cached.tags || []);
-    const articles = Array.from(document.querySelectorAll('.news-item'));
+      // 2) ak cache chýba/exp., postav index zo sitemapu (all pages -> full blog)
+      if(!cached){
+        const urls = await fetchSitemapUrls();
+        const articles = await fetchAllArticles(urls);
+        const allTags = saveCache(articles);
 
-    if (articles.length) buildFilters(allTags, articles);
-
-    if (!expired) {
-      console.log('[BlogFilter] Používam uložené tagy:', allTags.size);
-      return;
+        // ak filtre ešte nie sú, pridaj a aktivuj
+        let bar = document.querySelector('.blog-filters');
+        if(!bar) bar = renderFilters(allTags);
+        if(bar) attachFilterLogic(bar, articles);
+      }
+    }catch(e){
+      console.warn('[BlogFilter] Chyba inicializácie', e);
     }
-
-    console.log('[BlogFilter] Aktualizujem tagy zo sitemapu...');
-    const urls = await fetchSitemapUrls();
-    for (const url of urls) {
-      const tags = await extractTagsFromArticle(url);
-      tags.forEach(t => allTags.add(t));
-      // priebežné ukladanie
-      localStorage.setItem(TAGS_CACHE_KEY, JSON.stringify({ tags: [...allTags], _updated: now }));
-    }
-
-    console.log(`[BlogFilter] Tagy načítané: ${allTags.size}`);
-    buildFilters(allTags, articles);
-  }
-
-  init();
+  })();
 })();
+</script>
